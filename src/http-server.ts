@@ -1,13 +1,15 @@
 /**
- * MCP Server for Gemini
+ * MCP HTTP Server for Gemini (Railway-compatible)
  *
- * Provides Gemini models as MCP tools for Claude Code integration.
- * This is the original MCP server functionality, now modularized.
+ * Uses SSE (Server-Sent Events) transport over HTTP so the server
+ * can run as a hosted service on Railway (or any cloud platform).
+ *
+ * Claude.ai custom connector URL: https://<your-railway-url>/sse
  */
 
+import express from 'express'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { parseArgs } from 'node:util'
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 
 // Import tools
 import { getEnabledToolGroups, TOOL_GROUPS } from './tools/tool-groups.js'
@@ -30,239 +32,114 @@ import { registerTokenCountTool } from './tools/token-count.js'
 import { registerDeepResearchTool } from './tools/deep-research.js'
 import { registerImageAnalyzeTool } from './tools/image-analyze.js'
 
-// Import Gemini client and logger
 import { initGeminiClient } from './gemini-client.js'
-import { setupLogger, logger, LogLevel } from './utils/logger.js'
+import { setupLogger, logger } from './utils/logger.js'
 
-export async function startMcpServer(argv: string[]): Promise<void> {
-  // Parse command line arguments
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      verbose: {
-        type: 'boolean',
-        short: 'v',
-        default: false,
-      },
-      quiet: {
-        type: 'boolean',
-        short: 'q',
-        default: false,
-      },
-      help: {
-        type: 'boolean',
-        short: 'h',
-        default: false,
-      },
-    },
-    allowPositionals: true,
-  })
+// ─── Setup ───────────────────────────────────────────────────────────────────
 
-  // Show help if requested
-  if (values.help) {
-    console.log(`
-MCP Server Gemini - Integrates Google's Gemini models with Claude Code
+setupLogger('normal')
 
-Usage:
-  gemini-mcp [options]
-  gemini serve [options]
-
-Options:
-  -v, --verbose    Enable verbose logging (shows all prompts and responses)
-  -q, --quiet      Run in quiet mode (minimal logging)
-  -h, --help       Show this help message
-
-Environment Variables:
-  GEMINI_API_KEY   (required) Your Google Gemini API key
-  VERBOSE          (optional) Set to "true" to enable verbose logging
-  QUIET            (optional) Set to "true" to enable quiet mode
-  GEMINI_MODEL     (optional) Default Gemini model to use
-  GEMINI_PRO_MODEL (optional) Specify Pro model variant
-  GEMINI_FLASH_MODEL (optional) Specify Flash model variant
-  GEMINI_ENABLED_TOOLS (optional) Comma-separated list of tool groups to load
-  GEMINI_TOOL_PRESET   (optional) Preset profile: minimal, text, image, research, media, full
-
-For CLI mode, run: gemini --help
-  `)
-    process.exit(0)
-  }
-
-  // Configure logging mode based on command line args or environment variables
-  let logLevel: LogLevel = 'normal'
-  if (values.verbose || process.env.VERBOSE === 'true') {
-    logLevel = 'verbose'
-  } else if (values.quiet || process.env.QUIET === 'true') {
-    logLevel = 'quiet'
-  }
-  setupLogger(logLevel)
-
-  // Check for required API key
-  if (!process.env.GEMINI_API_KEY) {
-    logger.error('Error: GEMINI_API_KEY environment variable is required')
-    process.exit(1)
-  }
-
-  // Get model name from environment or use default
-  const defaultModel = 'gemini-3-pro-preview'
-  const geminiModel = process.env.GEMINI_MODEL || defaultModel
-
-  // Log model configuration for debugging
-  logger.debug(`Model configuration:
-  - GEMINI_MODEL: ${process.env.GEMINI_MODEL || '(not set, using default)'}
-  - GEMINI_PRO_MODEL: ${process.env.GEMINI_PRO_MODEL || '(not set, using default)'}
-  - GEMINI_FLASH_MODEL: ${process.env.GEMINI_FLASH_MODEL || '(not set, using default)'}`)
-
-  // Log tool configuration
-  const enabledGroups = getEnabledToolGroups()
-  logger.debug(`Tool configuration: ${enabledGroups.size} of ${Object.keys(TOOL_GROUPS).length} groups enabled`)
-  logger.info(`Loading ${enabledGroups.size} tool groups`)
-
-  logger.info(`Starting MCP Gemini Server with model: ${geminiModel}`)
-  logger.info(`Logging mode: ${logLevel}`)
-
-  // Handle unexpected stdio errors
-  process.stdin.on('error', (err) => {
-    logger.error('STDIN error:', err)
-  })
-
-  process.stdout.on('error', (err) => {
-    logger.error('STDOUT error:', err)
-  })
-
-  try {
-    // Initialize Gemini client
-    await initGeminiClient()
-
-    // Create MCP server
-    const server = new McpServer({
-      name: 'Gemini',
-      version: '0.7.2',
-    })
-
-    // Registry map of group ID -> register function
-    const toolRegistrations: Record<string, (server: McpServer) => void> = {
-      query: registerQueryTool,
-      brainstorm: registerBrainstormTool,
-      analyze: registerAnalyzeTool,
-      summarize: registerSummarizeTool,
-      'image-gen': registerImageGenTool,
-      'image-edit': registerImageEditTool,
-      'video-gen': registerVideoGenTool,
-      'code-exec': registerCodeExecTool,
-      search: registerSearchTool,
-      structured: registerStructuredTool,
-      youtube: registerYouTubeTool,
-      document: registerDocumentTool,
-      'url-context': registerUrlContextTool,
-      cache: registerCacheTool,
-      speech: registerSpeechTool,
-      'token-count': registerTokenCountTool,
-      'deep-research': registerDeepResearchTool,
-      'image-analyze': registerImageAnalyzeTool,
-    }
-
-    // Register tools based on configuration
-    for (const [groupId, registerFn] of Object.entries(toolRegistrations)) {
-      if (enabledGroups.has(groupId)) {
-        registerFn(server)
-      }
-    }
-
-    // Start server with stdio transport
-    const transport = new StdioServerTransport()
-
-    // Set up error handling for transport
-    transport.onclose = () => {
-      logger.warn('MCP transport connection closed')
-      logger.debug('Connection closed event triggered')
-
-      // Attempt to recover connection with backoff strategy
-      let reconnectAttempts = 0
-      const maxReconnectAttempts = 5
-
-      const attemptReconnect = () => {
-        if (reconnectAttempts >= maxReconnectAttempts) {
-          logger.error(`Failed to reconnect after ${maxReconnectAttempts} attempts`)
-          return
-        }
-
-        reconnectAttempts++
-        const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts - 1), 10000)
-
-        logger.info(`Attempting to reconnect (${reconnectAttempts}/${maxReconnectAttempts}) after ${delay}ms...`)
-
-        setTimeout(() => {
-          try {
-            if (process.stdin.destroyed || process.stdout.destroyed) {
-              logger.error('Cannot reconnect: stdin or stdout is destroyed')
-              return
-            }
-
-            server
-              .connect(transport)
-              .then(() => {
-                logger.info('Successfully reconnected to MCP transport')
-                reconnectAttempts = 0
-              })
-              .catch((e) => {
-                logger.error('Reconnection failed:', e)
-                attemptReconnect()
-              })
-          } catch (e) {
-            logger.error('Error during reconnection attempt:', e)
-            attemptReconnect()
-          }
-        }, delay)
-      }
-
-      attemptReconnect()
-    }
-
-    transport.onerror = (error) => {
-      logger.error('MCP transport error:', error)
-      if (error instanceof Error) {
-        logger.debug(`Error name: ${error.name}, message: ${error.message}`)
-        logger.debug(`Stack trace: ${error.stack}`)
-      }
-    }
-
-    // Connect to transport
-    try {
-      logger.debug(`Process details - PID: ${process.pid}, Node version: ${process.version}`)
-      logger.debug(
-        `Environment variables: API_KEY=${process.env.GEMINI_API_KEY ? 'SET' : 'NOT_SET'}, VERBOSE=${process.env.VERBOSE || 'not set'}`
-      )
-      logger.debug(`Process stdin/stdout state - isTTY: ${process.stdin.isTTY}, ${process.stdout.isTTY}`)
-
-      await server.connect(transport)
-      logger.info('MCP Gemini Server running')
-    } catch (err) {
-      logger.error('Failed to connect MCP server transport:', err)
-
-      if (err instanceof Error) {
-        logger.debug(`Error stack: ${err.stack}`)
-        logger.debug(`Error details: name=${err.name}, message=${err.message}`)
-      } else {
-        logger.debug(`Non-Error object thrown: ${JSON.stringify(err)}`)
-      }
-
-      logger.warn('Server will attempt to continue running despite connection error')
-    }
-
-    // Handle process termination
-    process.on('SIGINT', async () => {
-      logger.info('Shutting down MCP Gemini Server')
-      await server.close()
-      process.exit(0)
-    })
-
-    process.on('SIGTERM', async () => {
-      logger.info('Shutting down MCP Gemini Server')
-      await server.close()
-      process.exit(0)
-    })
-  } catch (error) {
-    logger.error('Failed to start MCP Gemini Server:', error)
-    process.exit(1)
-  }
+if (!process.env.GEMINI_API_KEY) {
+  console.error('Error: GEMINI_API_KEY environment variable is required')
+  process.exit(1)
 }
+
+const PORT = parseInt(process.env.PORT || '3000', 10)
+
+// ─── MCP server factory ───────────────────────────────────────────────────────
+
+function createMcpServer(): McpServer {
+  const server = new McpServer({
+    name: 'Gemini',
+    version: '0.8.1',
+  })
+
+  const toolRegistrations: Record<string, (server: McpServer) => void> = {
+    query: registerQueryTool,
+    brainstorm: registerBrainstormTool,
+    analyze: registerAnalyzeTool,
+    summarize: registerSummarizeTool,
+    'image-gen': registerImageGenTool,
+    'image-edit': registerImageEditTool,
+    'video-gen': registerVideoGenTool,
+    'code-exec': registerCodeExecTool,
+    search: registerSearchTool,
+    structured: registerStructuredTool,
+    youtube: registerYouTubeTool,
+    document: registerDocumentTool,
+    'url-context': registerUrlContextTool,
+    cache: registerCacheTool,
+    speech: registerSpeechTool,
+    'token-count': registerTokenCountTool,
+    'deep-research': registerDeepResearchTool,
+    'image-analyze': registerImageAnalyzeTool,
+  }
+
+  const enabledGroups = getEnabledToolGroups()
+  logger.info(`Loading ${enabledGroups.size} of ${Object.keys(TOOL_GROUPS).length} tool groups`)
+
+  for (const [groupId, registerFn] of Object.entries(toolRegistrations)) {
+    if (enabledGroups.has(groupId)) {
+      registerFn(server)
+    }
+  }
+
+  return server
+}
+
+// ─── Express app ──────────────────────────────────────────────────────────────
+
+async function main() {
+  await initGeminiClient()
+  logger.info('Gemini client initialized')
+
+  const app = express()
+
+  // In-memory transport store (one per SSE connection)
+  const transports: Record<string, SSEServerTransport> = {}
+
+  // Health check — Railway uses this
+  app.get('/health', (_req, res) => {
+    res.json({ status: 'ok', service: 'gemini-mcp' })
+  })
+
+  // SSE endpoint — Claude connects here
+  app.get('/sse', async (req, res) => {
+    logger.info(`SSE connection opened from ${req.ip}`)
+
+    const transport = new SSEServerTransport('/messages', res)
+    transports[transport.sessionId] = transport
+
+    res.on('close', () => {
+      logger.info(`SSE connection closed: ${transport.sessionId}`)
+      delete transports[transport.sessionId]
+    })
+
+    const server = createMcpServer()
+    await server.connect(transport)
+  })
+
+  // Message endpoint — Claude posts tool calls here
+  app.post('/messages', express.json(), async (req, res) => {
+    const sessionId = req.query.sessionId as string
+    const transport = transports[sessionId]
+
+    if (!transport) {
+      res.status(404).json({ error: `Session not found: ${sessionId}` })
+      return
+    }
+
+    await transport.handlePostMessage(req, res)
+  })
+
+  app.listen(PORT, () => {
+    logger.info(`Gemini MCP HTTP server listening on port ${PORT}`)
+    logger.info(`SSE endpoint: http://localhost:${PORT}/sse`)
+    logger.info(`Health check: http://localhost:${PORT}/health`)
+  })
+}
+
+main().catch((err) => {
+  console.error('Fatal error:', err)
+  process.exit(1)
+})
